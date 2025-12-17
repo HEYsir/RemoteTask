@@ -23,6 +23,14 @@ pub struct DigestAuthConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeneratedField {
+    pub name: String,          // 字段名
+    pub generator: String,     // 生成器类型："random", "timestamp", "counter", "uuid"
+    pub field_type: String,    // 字段类型："header" 或 "body"
+    pub value: Option<String>, // 生成的值（可选，用于固定值）
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestConfig {
     pub request_a: HttpRequestConfig,
     pub request_b: HttpRequestConfig,
@@ -30,6 +38,7 @@ pub struct RequestConfig {
     pub delay_between_a_requests_ms: u64,
     pub max_requests: Option<usize>,
     pub digest_auth: Option<DigestAuthConfig>,
+    pub generated_fields: Option<Vec<GeneratedField>>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +68,7 @@ impl Default for RequestConfig {
             delay_between_a_requests_ms: 1000,
             max_requests: None,
             digest_auth: None,
+            generated_fields: None,
         }
     }
 }
@@ -104,10 +114,94 @@ fn build_digest_auth_header(
     )
 }
 
+// Field generator functions
+fn generate_field(field: &GeneratedField, cycle: usize) -> String {
+    match field.generator.as_str() {
+        "random" => {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            let random_num: u32 = rng.gen_range(1000..9999);
+            format!("random_{}_{}", cycle, random_num)
+        }
+        "timestamp" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            format!("timestamp_{}_{}", cycle, now)
+        }
+        "counter" => format!("counter_{}", cycle),
+        "uuid" => {
+            use uuid::Uuid;
+            Uuid::new_v4().to_string()
+        }
+        "fixed" => field.value.clone().unwrap_or_else(|| "default".to_string()),
+        _ => field.value.clone().unwrap_or_else(|| "unknown".to_string()),
+    }
+}
+
+// Separate fields by type (header vs body)
+fn separate_fields_by_type(
+    generated_fields: &Option<Vec<GeneratedField>>,
+    cycle: usize,
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let mut header_fields = HashMap::new();
+    let mut body_fields = HashMap::new();
+
+    if let Some(field_configs) = generated_fields {
+        for field_config in field_configs {
+            let value = generate_field(field_config, cycle);
+            if field_config.field_type == "body" {
+                body_fields.insert(field_config.name.clone(), value);
+            } else {
+                header_fields.insert(field_config.name.clone(), value);
+            }
+        }
+    }
+
+    (header_fields, body_fields)
+}
+
+// Generate dynamic body content
+fn generate_dynamic_body(
+    base_body: &Option<String>,
+    body_fields: &HashMap<String, String>,
+) -> Option<String> {
+    if let Some(body) = base_body {
+        let mut dynamic_body = body.clone();
+
+        // Replace placeholders in the body with generated values
+        for (field_name, field_value) in body_fields {
+            let placeholder = format!("{{{}}}", field_name);
+            dynamic_body = dynamic_body.replace(&placeholder, field_value);
+        }
+
+        Some(dynamic_body)
+    } else {
+        // If no base body, create a JSON object with body fields
+        if !body_fields.is_empty() {
+            let mut json_body = String::from("{");
+            let mut first = true;
+            for (key, value) in body_fields {
+                if !first {
+                    json_body.push(',');
+                }
+                json_body.push_str(&format!("\"{}\":\"{}\"", key, value));
+                first = false;
+            }
+            json_body.push('}');
+            Some(json_body)
+        } else {
+            None
+        }
+    }
+}
+
 async fn send_request_with_auth(
     client: &Client,
     config: &HttpRequestConfig,
     auth_config: Option<&DigestAuthConfig>,
+    header_fields: Option<&HashMap<String, String>>,
 ) -> Result<(), String> {
     let start_time = Instant::now();
 
@@ -120,6 +214,14 @@ async fn send_request_with_auth(
     // Add headers if provided
     if let Some(headers) = &config.headers {
         for (key, value) in headers {
+            request_builder = request_builder.header(key, value);
+        }
+    }
+
+    // Add generated header fields if provided
+    if let Some(fields) = header_fields {
+        println!("📤 Injecting header fields: {:?}", fields);
+        for (key, value) in fields {
             request_builder = request_builder.header(key, value);
         }
     }
@@ -186,11 +288,18 @@ async fn send_request_with_auth(
 async fn send_request_async(
     client: Client,
     config: HttpRequestConfig,
-    request_type: String,
+    _request_type: String,
     stats: Arc<Mutex<RequestStats>>,
     auth_config: Option<DigestAuthConfig>,
+    header_fields: Option<HashMap<String, String>>,
 ) {
-    let result = send_request_with_auth(&client, &config, auth_config.as_ref()).await;
+    let result = send_request_with_auth(
+        &client,
+        &config,
+        auth_config.as_ref(),
+        header_fields.as_ref(),
+    )
+    .await;
 
     let mut stats_guard = stats.lock().await;
     stats_guard.total_requests += 1;
@@ -229,6 +338,36 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
             request_count += 1;
             println!("\n--- Request Cycle {} ---", request_count);
 
+            // Separate fields by type (header vs body)
+            let (header_fields, body_fields) =
+                separate_fields_by_type(&config_clone.generated_fields, request_count);
+
+            if !header_fields.is_empty() {
+                println!("🎲 Generated header fields: {:?}", header_fields);
+            }
+            if !body_fields.is_empty() {
+                println!("📝 Generated body fields: {:?}", body_fields);
+            }
+
+            // Create dynamic body content for A and B requests
+            let config_a = {
+                let mut config = config_clone.request_a.clone();
+                if !body_fields.is_empty() {
+                    config.body = generate_dynamic_body(&config.body, &body_fields);
+                    println!("📝 Dynamic body for A: {:?}", config.body);
+                }
+                config
+            };
+
+            let config_b = {
+                let mut config = config_clone.request_b.clone();
+                if !body_fields.is_empty() {
+                    config.body = generate_dynamic_body(&config.body, &body_fields);
+                    println!("📝 Dynamic body for B: {:?}", config.body);
+                }
+                config
+            };
+
             // Calculate time since last A request to ensure proper spacing
             let time_since_last_a = last_a_request_time.elapsed();
             let required_delay = Duration::from_millis(config_clone.delay_between_a_requests_ms);
@@ -252,33 +391,33 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
             let stats_a = Arc::clone(&stats_clone);
             let stats_b = Arc::clone(&stats_clone);
 
-            let config_a = config_clone.request_a.clone();
-            let config_b = config_clone.request_b.clone();
-
             let auth_config = config_clone.digest_auth.clone();
+            let header_fields_clone = header_fields.clone();
 
-            // Send request A (doesn't wait for completion)
+            // Send request A with header fields
             let a_handle = tokio::spawn(send_request_async(
                 client_a,
                 config_a,
                 "A".to_string(),
                 stats_a,
                 auth_config.clone(),
+                Some(header_fields),
             ));
 
-            // Wait before sending request B (but don't wait for A to complete)
+            // Wait before sending request B
             sleep(Duration::from_millis(config_clone.delay_between_a_and_b_ms)).await;
 
-            // Send request B (concurrent with A)
+            // Send request B with the same header fields
             let b_handle = tokio::spawn(send_request_async(
                 client_b,
                 config_b,
                 "B".to_string(),
                 stats_b,
                 auth_config,
+                Some(header_fields_clone),
             ));
 
-            // Wait for both requests to complete before next cycle
+            // Wait for both requests to complete
             let _ = tokio::try_join!(a_handle, b_handle);
         }
     });
@@ -288,7 +427,8 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
     println!("Features:");
     println!("  ✅ GET and POST requests supported");
     println!("  ✅ Digest authentication supported");
-    println!("  ✅ A and B requests sent concurrently");
+    println!("  ✅ A and B requests with shared generated fields");
+    println!("  ✅ Header and body field generation support");
     println!("  ✅ Precise delay control");
     println!("Press Ctrl+C to stop...");
 
@@ -306,7 +446,7 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
 async fn main() {
     println!("🌐 Advanced Rust Concurrent HTTP Request Tool");
     println!("==============================================");
-    println!("📝 Features: GET/POST requests, Digest auth, concurrent execution");
+    println!("📝 Features: GET/POST requests, Digest auth, field generation");
     println!();
 
     // Example configuration with POST requests and digest auth
@@ -319,7 +459,7 @@ async fn main() {
                 headers.insert("Content-Type".to_string(), "application/json".to_string());
                 headers
             }),
-            body: Some(r#"{"message": "Hello from request A"}"#.to_string()),
+            body: Some(r#"{"message": "Hello from request A", "session_id": "{session_id}", "request_id": "{request_id}", "timestamp": "{timestamp}"}"#.to_string()),
         },
         request_b: HttpRequestConfig {
             method: "GET".to_string(),
@@ -336,6 +476,32 @@ async fn main() {
             realm: Some("testrealm".to_string()),
             nonce: Some("123456".to_string()),
         }),
+        generated_fields: Some(vec![
+            GeneratedField {
+                name: "session_id".to_string(),
+                generator: "random".to_string(),
+                field_type: "body".to_string(),
+                value: None,
+            },
+            GeneratedField {
+                name: "request_id".to_string(),
+                generator: "counter".to_string(),
+                field_type: "body".to_string(),
+                value: None,
+            },
+            GeneratedField {
+                name: "timestamp".to_string(),
+                generator: "timestamp".to_string(),
+                field_type: "body".to_string(),
+                value: None,
+            },
+            GeneratedField {
+                name: "X-Session-ID".to_string(),
+                generator: "random".to_string(),
+                field_type: "header".to_string(),
+                value: None,
+            },
+        ]),
     };
 
     println!("📋 Configuration:");
@@ -353,6 +519,17 @@ async fn main() {
     if let Some(auth) = &config.digest_auth {
         println!("    Username: {}", auth.username);
         println!("    Realm: {}", auth.realm.as_deref().unwrap_or("default"));
+    } else {
+        println!("    None");
+    }
+    println!("  Generated Fields:");
+    if let Some(fields) = &config.generated_fields {
+        for field in fields {
+            println!(
+                "    {}: {} ({})",
+                field.name, field.generator, field.field_type
+            );
+        }
     } else {
         println!("    None");
     }
