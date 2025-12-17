@@ -1,61 +1,87 @@
-# Rust Concurrent HTTP Request Tool
+# Advanced Rust Concurrent HTTP Request Tool
 
-这是一个用Rust实现的并发HTTP请求工具，支持控制A请求和B请求之间的延迟，以及连续A请求之间的延迟。
+这是一个用Rust实现的高级并发HTTP请求工具，支持GET/POST请求、digest认证、精确的延迟控制和并发执行。
 
 ## 功能特性
 
-- ✅ 发送A请求后发送B请求
-- ✅ 持续发送请求（可配置最大次数）
-- ✅ 控制A请求和B请求之间的延迟
-- ✅ 控制连续A请求之间的延迟
-- ✅ 防止A请求重叠（修复版本）
-- ✅ 详细的请求统计和错误处理
+- ✅ **GET和POST请求支持** - 支持两种HTTP方法，可自定义请求头和请求体
+- ✅ **Digest认证支持** - 完整的digest认证实现
+- ✅ **A和B请求并发执行** - A请求发送后立即发送B请求，不等待A返回
+- ✅ **精确延迟控制** - A→B延迟和A→A延迟都可精确控制
+- ✅ **防止A请求重叠** - 确保连续A请求之间的间隔准确
+- ✅ **详细统计和错误处理** - 完整的请求统计和错误信息
+- ✅ **可配置参数** - 所有参数都可灵活配置
 
 ## 项目结构
 
 ```
 src/
-├── main.rs                 # 原始顺序实现版本
-├── test_concurrent.rs      # 测试程序（用于检测重叠）
-├── concurrent_fixed.rs     # 修复版本（防止A请求重叠）
-└── concurrent_parallel.rs  # 真正并行版本（A和B并发发送）
+└── main.rs  # 完整功能版本（包含GET/POST、digest认证、并发执行）
 ```
 
 ## 使用方法
 
-### 运行原始版本（顺序执行）
-
 ```bash
-cargo run --bin main
-```
-
-### 运行测试程序（检测重叠）
-
-```bash
-cargo run --bin test_concurrent
-```
-
-### 运行修复版本（防止重叠，顺序执行）
-
-```bash
-cargo run --bin concurrent_fixed
-```
-
-### 运行并行版本（A和B并发发送）
-
-```bash
-cargo run --bin concurrent_parallel
+# 运行完整功能版本
+cargo run
 ```
 
 ## 配置参数
 
-在代码中可以配置以下参数：
+### 请求配置 (HttpRequestConfig)
 
-- `url_a`: A请求的URL
-- `url_b`: B请求的URL  
+- `method`: HTTP方法 ("GET" 或 "POST")
+- `url`: 请求URL
+- `headers`: 可选的请求头 (HashMap<String, String>)
+- `body`: POST请求的请求体 (JSON字符串)
+
+### 认证配置 (DigestAuthConfig)
+
+- `username`: digest认证用户名
+- `password`: digest认证密码  
+- `realm`: 认证域 (可选)
+- `nonce`: 随机数 (可选)
+
+### 主配置 (RequestConfig)
+
+- `request_a`: A请求配置
+- `request_b`: B请求配置
 - `delay_between_a_and_b_ms`: A和B请求之间的延迟（毫秒）
 - `delay_between_a_requests_ms`: 连续A请求之间的延迟（毫秒）
 - `max_requests`: 最大请求次数（可选）
+- `digest_auth`: digest认证配置（可选）
+
+## 配置示例
+
+```rust
+let config = RequestConfig {
+    request_a: HttpRequestConfig {
+        method: "POST".to_string(),
+        url: "https://httpbin.org/post".to_string(),
+        headers: Some({
+            let mut headers = HashMap::new();
+            headers.insert("Content-Type".to_string(), "application/json".to_string());
+            headers
+        }),
+        body: Some(r#"{"message": "Hello from request A"}"#.to_string()),
+    },
+    request_b: HttpRequestConfig {
+        method: "GET".to_string(),
+        url: "https://httpbin.org/get".to_string(),
+        headers: None,
+        body: None,
+    },
+    delay_between_a_and_b_ms: 500,
+    delay_between_a_requests_ms: 3000,
+    max_requests: Some(3),
+    digest_auth: Some(DigestAuthConfig {
+        username: "testuser".to_string(),
+        password: "testpass".to_string(),
+        realm: Some("testrealm".to_string()),
+        nonce: Some("123456".to_string()),
+    }),
+};
+```
 
 ## 实现说明
 

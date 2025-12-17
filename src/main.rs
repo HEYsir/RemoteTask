@@ -1,94 +1,224 @@
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, sleep_until};
+use tokio::time::{Instant, sleep};
 
-// 定义必要的类型
-type Response = String; // 或者使用具体的响应类型，比如 reqwest::Response
-type Error = Box<dyn std::error::Error + Send + Sync>;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpRequestConfig {
+    pub method: String, // "GET" or "POST"
+    pub url: String,
+    pub headers: Option<HashMap<String, String>>,
+    pub body: Option<String>, // JSON string for POST requests
+}
 
-#[derive(Clone, Default, Debug)]
-struct RequestStats {
-    total_requests: u32,
-    successful_requests: u32,
-    failed_requests: u32,
-    last_error: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DigestAuthConfig {
+    pub username: String,
+    pub password: String,
+    pub realm: Option<String>,
+    pub nonce: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestConfig {
+    pub request_a: HttpRequestConfig,
+    pub request_b: HttpRequestConfig,
+    pub delay_between_a_and_b_ms: u64,
+    pub delay_between_a_requests_ms: u64,
+    pub max_requests: Option<usize>,
+    pub digest_auth: Option<DigestAuthConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestStats {
+    pub total_requests: usize,
+    pub successful_requests: usize,
+    pub failed_requests: usize,
+    pub last_error: Option<String>,
+}
+
+impl Default for RequestConfig {
+    fn default() -> Self {
+        Self {
+            request_a: HttpRequestConfig {
+                method: "GET".to_string(),
+                url: "https://httpbin.org/get".to_string(),
+                headers: None,
+                body: None,
+            },
+            request_b: HttpRequestConfig {
+                method: "GET".to_string(),
+                url: "https://httpbin.org/get".to_string(),
+                headers: None,
+                body: None,
+            },
+            delay_between_a_and_b_ms: 100,
+            delay_between_a_requests_ms: 1000,
+            max_requests: None,
+            digest_auth: None,
+        }
+    }
 }
 
 impl RequestStats {
-    fn new() -> Self {
-        Self::default()
+    pub fn new() -> Self {
+        Self {
+            total_requests: 0,
+            successful_requests: 0,
+            failed_requests: 0,
+            last_error: None,
+        }
     }
 }
 
-#[derive(Clone)]
-struct RequestConfig {
-    url_a: String,
-    url_b: String,
-    max_requests: Option<u32>,
-    delay_between_a_and_b_ms: u64,
-    delay_between_a_requests_ms: u64,
-    wait_for_a_completion: bool,
+// Simple digest authentication implementation
+fn build_digest_auth_header(
+    method: &str,
+    uri: &str,
+    username: &str,
+    password: &str,
+    realm: &str,
+    nonce: &str,
+) -> String {
+    use base64::prelude::*;
+    use md5::{Digest, Md5};
+
+    // HA1 = MD5(username:realm:password)
+    let ha1_data = format!("{}:{}:{}", username, realm, password);
+    let ha1 = format!("{:x}", Md5::digest(ha1_data.as_bytes()));
+
+    // HA2 = MD5(method:uri)
+    let ha2_data = format!("{}:{}", method, uri);
+    let ha2 = format!("{:x}", Md5::digest(ha2_data.as_bytes()));
+
+    // Response = MD5(HA1:nonce:HA2)
+    let response_data = format!("{}:{}:{}", ha1, nonce, ha2);
+    let response = format!("{:x}", Md5::digest(response_data.as_bytes()));
+
+    format!(
+        "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\"",
+        username, realm, nonce, uri, response
+    )
 }
 
-// 假设的 HTTP 客户端（根据你的实际实现调整）
-#[derive(Clone)]
-struct Client;
+async fn send_request_with_auth(
+    client: &Client,
+    config: &HttpRequestConfig,
+    auth_config: Option<&DigestAuthConfig>,
+) -> Result<(), String> {
+    let start_time = Instant::now();
 
-impl Client {
-    fn new() -> Self {
-        Client
+    let mut request_builder = match config.method.to_uppercase().as_str() {
+        "GET" => client.get(&config.url),
+        "POST" => client.post(&config.url),
+        method => return Err(format!("Unsupported HTTP method: {}", method)),
+    };
+
+    // Add headers if provided
+    if let Some(headers) = &config.headers {
+        for (key, value) in headers {
+            request_builder = request_builder.header(key, value);
+        }
+    }
+
+    // Add body for POST requests
+    if config.method.to_uppercase() == "POST" {
+        if let Some(body) = &config.body {
+            request_builder = request_builder.body(body.clone());
+        }
+    }
+
+    // Add digest authentication if configured
+    if let Some(auth) = auth_config {
+        let realm = auth.realm.as_deref().unwrap_or("");
+        let nonce = auth.nonce.as_deref().unwrap_or("123456");
+        let auth_header = build_digest_auth_header(
+            &config.method,
+            &config.url,
+            &auth.username,
+            &auth.password,
+            realm,
+            nonce,
+        );
+        request_builder = request_builder.header("Authorization", &auth_header);
+    }
+
+    match request_builder.send().await {
+        Ok(response) => {
+            let duration = start_time.elapsed();
+            if response.status().is_success() {
+                println!(
+                    "✅ {} request to {} succeeded in {:.2}ms (Status: {})",
+                    config.method,
+                    config.url,
+                    duration.as_millis(),
+                    response.status()
+                );
+                Ok(())
+            } else {
+                let error_msg = format!(
+                    "❌ {} request to {} failed with status: {} in {:.2}ms",
+                    config.method,
+                    config.url,
+                    response.status(),
+                    duration.as_millis()
+                );
+                Err(error_msg)
+            }
+        }
+        Err(e) => {
+            let duration = start_time.elapsed();
+            let error_msg = format!(
+                "❌ {} request to {} failed with error: {} in {:.2}ms",
+                config.method,
+                config.url,
+                e,
+                duration.as_millis()
+            );
+            Err(error_msg)
+        }
     }
 }
 
-// 发送请求的函数（根据你的实际实现调整）
-async fn send_request(
-    _client: &Client,
-    _url: &str,
-    _request_type: &str,
-) -> Result<Response, Error> {
-    // 这里应该是实际的 HTTP 请求逻辑
-    // 示例：返回一个简单的字符串
-    Ok("Response received".to_string())
-}
-
-// 辅助函数：更新统计信息
-async fn update_stats(
-    stats: &Arc<Mutex<RequestStats>>,
-    result: &Result<Response, Error>,
-    request_type: &str,
+async fn send_request_async(
+    client: Client,
+    config: HttpRequestConfig,
+    request_type: String,
+    stats: Arc<Mutex<RequestStats>>,
+    auth_config: Option<DigestAuthConfig>,
 ) {
+    let result = send_request_with_auth(&client, &config, auth_config.as_ref()).await;
+
     let mut stats_guard = stats.lock().await;
     stats_guard.total_requests += 1;
 
-    match result {
+    match &result {
         Ok(_) => {
             stats_guard.successful_requests += 1;
-            println!("✅ {} request succeeded", request_type);
         }
         Err(e) => {
             stats_guard.failed_requests += 1;
-            stats_guard.last_error = Some(e.to_string());
-            println!("❌ {} request failed: {}", request_type, e);
+            stats_guard.last_error = Some(e.clone());
         }
     }
 }
 
 async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
-    let client = Client::new();
     let stats = Arc::new(Mutex::new(RequestStats::new()));
     let config = Arc::new(config);
 
     let stats_clone = Arc::clone(&stats);
     let config_clone = Arc::clone(&config);
 
-    let handle = tokio::spawn(async move {
+    let request_task = tokio::spawn(async move {
         let mut request_count = 0;
-        let mut last_a_start_time = Instant::now();
-        let mut pending_a_requests = Vec::new();
+        let mut last_a_request_time = Instant::now();
 
         loop {
-            // 检查是否达到最大请求数
+            // Check if we've reached the maximum number of requests
             if let Some(max) = config_clone.max_requests {
                 if request_count >= max {
                     println!("🎯 Reached maximum request count of {}", max);
@@ -99,134 +229,143 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
             request_count += 1;
             println!("\n--- Request Cycle {} ---", request_count);
 
-            let cycle_start = Instant::now();
+            // Calculate time since last A request to ensure proper spacing
+            let time_since_last_a = last_a_request_time.elapsed();
+            let required_delay = Duration::from_millis(config_clone.delay_between_a_requests_ms);
 
-            // 计算下一个A请求应该开始的时间
-            let next_a_time = if request_count > 1 {
-                last_a_start_time + Duration::from_millis(config_clone.delay_between_a_requests_ms)
-            } else {
-                Instant::now() // 第一次立即开始
-            };
-
-            // 如果不是第一次请求，需要等待到下一个A请求的时间
-            if request_count > 1 {
-                let now = Instant::now();
-                if now < next_a_time {
-                    sleep_until(next_a_time.into()).await;
-                }
+            if time_since_last_a < required_delay {
+                let remaining_delay = required_delay - time_since_last_a;
+                println!(
+                    "⏳ Waiting {}ms to ensure proper A request spacing",
+                    remaining_delay.as_millis()
+                );
+                sleep(remaining_delay).await;
             }
 
-            last_a_start_time = Instant::now();
+            // Update last A request time
+            last_a_request_time = Instant::now();
 
-            if config_clone.wait_for_a_completion {
-                // 模式1：等待A完成
-                let a_result = send_request(&client, &config_clone.url_a, "A").await;
-                update_stats(&stats_clone, &a_result, "A").await;
+            // Create separate clients for A and B requests
+            let client_a = Client::new();
+            let client_b = Client::new();
 
-                // 计算A和B之间的实际等待时间
-                let elapsed = last_a_start_time.elapsed();
-                let remaining_delay =
-                    if elapsed < Duration::from_millis(config_clone.delay_between_a_and_b_ms) {
-                        Duration::from_millis(config_clone.delay_between_a_and_b_ms) - elapsed
-                    } else {
-                        Duration::ZERO
-                    };
+            let stats_a = Arc::clone(&stats_clone);
+            let stats_b = Arc::clone(&stats_clone);
 
-                // 等待配置的A-B延时后发送B请求
-                if remaining_delay > Duration::ZERO {
-                    sleep(remaining_delay).await;
-                }
+            let config_a = config_clone.request_a.clone();
+            let config_b = config_clone.request_b.clone();
 
-                // 发送B请求
-                let b_result = send_request(&client, &config_clone.url_b, "B").await;
-                update_stats(&stats_clone, &b_result, "B").await;
-            } else {
-                // 模式2：不等待A完成
+            let auth_config = config_clone.digest_auth.clone();
 
-                // 启动A请求（后台执行）
-                let a_handle = tokio::spawn({
-                    let client = client.clone();
-                    let url = config_clone.url_a.clone();
-                    let stats = stats_clone.clone();
-                    async move {
-                        let result = send_request(&client, &url, "A").await;
-                        update_stats(&stats, &result, "A").await;
-                        result
-                    }
-                });
+            // Send request A (doesn't wait for completion)
+            let a_handle = tokio::spawn(send_request_async(
+                client_a,
+                config_a,
+                "A".to_string(),
+                stats_a,
+                auth_config.clone(),
+            ));
 
-                // 记录A请求以便后续清理（如果需要）
-                pending_a_requests.push(a_handle);
+            // Wait before sending request B (but don't wait for A to complete)
+            sleep(Duration::from_millis(config_clone.delay_between_a_and_b_ms)).await;
 
-                // 计算A和B之间的实际等待时间
-                let elapsed = last_a_start_time.elapsed();
-                let remaining_delay =
-                    if elapsed < Duration::from_millis(config_clone.delay_between_a_and_b_ms) {
-                        Duration::from_millis(config_clone.delay_between_a_and_b_ms) - elapsed
-                    } else {
-                        Duration::ZERO
-                    };
+            // Send request B (concurrent with A)
+            let b_handle = tokio::spawn(send_request_async(
+                client_b,
+                config_b,
+                "B".to_string(),
+                stats_b,
+                auth_config,
+            ));
 
-                // 等待配置的A-B延时后发送B请求
-                if remaining_delay > Duration::ZERO {
-                    sleep(remaining_delay).await;
-                }
-
-                // 发送B请求
-                let b_result = send_request(&client, &config_clone.url_b, "B").await;
-                update_stats(&stats_clone, &b_result, "B").await;
-
-                // 清理已完成的任务（避免内存泄漏）
-                pending_a_requests.retain(|handle| !handle.is_finished());
-            }
-
-            println!("✅ Cycle {} completed", request_count);
-        }
-
-        // 等待所有未完成的A请求完成（可选）
-        if !config_clone.wait_for_a_completion {
-            println!("🔄 Waiting for pending A requests to complete...");
-            for handle in pending_a_requests {
-                let _ = handle.await;
-            }
+            // Wait for both requests to complete before next cycle
+            let _ = tokio::try_join!(a_handle, b_handle);
         }
     });
 
-    // 等待用户中断
-    println!("🚀 Concurrent requests started!");
-    println!(
-        "Configuration: wait_for_a_completion = {}",
-        config.wait_for_a_completion
-    );
+    // Wait for the request task to complete
+    println!("🚀 Concurrent HTTP requests started!");
+    println!("Features:");
+    println!("  ✅ GET and POST requests supported");
+    println!("  ✅ Digest authentication supported");
+    println!("  ✅ A and B requests sent concurrently");
+    println!("  ✅ Precise delay control");
     println!("Press Ctrl+C to stop...");
 
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for Ctrl+C");
+    match request_task.await {
+        Ok(_) => println!("\n✅ All request cycles completed!"),
+        Err(e) => println!("\n❌ Request task failed: {}", e),
+    }
 
-    println!("\n🛑 Stopping concurrent requests...");
-
-    // 取消任务
-    handle.abort();
-    let _ = handle.await; // 等待任务完全停止
-
-    // 返回最终统计
+    // Return final stats
     let stats_guard = stats.lock().await;
     stats_guard.clone()
 }
 
-// 使用示例
 #[tokio::main]
 async fn main() {
+    println!("🌐 Advanced Rust Concurrent HTTP Request Tool");
+    println!("==============================================");
+    println!("📝 Features: GET/POST requests, Digest auth, concurrent execution");
+    println!();
+
+    // Example configuration with POST requests and digest auth
     let config = RequestConfig {
-        url_a: "http://example.com/a".to_string(),
-        url_b: "http://example.com/b".to_string(),
-        max_requests: Some(10),
-        delay_between_a_and_b_ms: 100,
-        delay_between_a_requests_ms: 500,
-        wait_for_a_completion: false, // 设置为 true 则等待A完成
+        request_a: HttpRequestConfig {
+            method: "POST".to_string(),
+            url: "https://httpbin.org/post".to_string(),
+            headers: Some({
+                let mut headers = HashMap::new();
+                headers.insert("Content-Type".to_string(), "application/json".to_string());
+                headers
+            }),
+            body: Some(r#"{"message": "Hello from request A"}"#.to_string()),
+        },
+        request_b: HttpRequestConfig {
+            method: "GET".to_string(),
+            url: "https://httpbin.org/get".to_string(),
+            headers: None,
+            body: None,
+        },
+        delay_between_a_and_b_ms: 500,
+        delay_between_a_requests_ms: 3000,
+        max_requests: Some(3),
+        digest_auth: Some(DigestAuthConfig {
+            username: "testuser".to_string(),
+            password: "testpass".to_string(),
+            realm: Some("testrealm".to_string()),
+            nonce: Some("123456".to_string()),
+        }),
     };
 
+    println!("📋 Configuration:");
+    println!("  Request A:");
+    println!("    Method: {}", config.request_a.method);
+    println!("    URL: {}", config.request_a.url);
+    println!("    Body: {:?}", config.request_a.body);
+    println!("  Request B:");
+    println!("    Method: {}", config.request_b.method);
+    println!("    URL: {}", config.request_b.url);
+    println!("  Delays:");
+    println!("    A→B: {}ms", config.delay_between_a_and_b_ms);
+    println!("    A→A: {}ms", config.delay_between_a_requests_ms);
+    println!("  Authentication:");
+    if let Some(auth) = &config.digest_auth {
+        println!("    Username: {}", auth.username);
+        println!("    Realm: {}", auth.realm.as_deref().unwrap_or("default"));
+    } else {
+        println!("    None");
+    }
+    println!();
+
+    // Run the concurrent requests
     let stats = run_concurrent_requests(config).await;
-    println!("Final stats: {:?}", stats);
+
+    println!("\n📊 Final Statistics:");
+    println!("  Total requests: {}", stats.total_requests);
+    println!("  Successful: {}", stats.successful_requests);
+    println!("  Failed: {}", stats.failed_requests);
+    if let Some(error) = &stats.last_error {
+        println!("  Last error: {}", error);
+    }
 }

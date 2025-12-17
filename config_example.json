@@ -1,0 +1,25 @@
+{
+    "request_a": {
+        "method": "POST",
+        "url": "https://httpbin.org/post",
+        "headers": {
+            "Content-Type": "application/json"
+        },
+        "body": "{\"message\": \"Hello from request A\"}"
+    },
+    "request_b": {
+        "method": "GET",
+        "url": "https://httpbin.org/get",
+        "headers": { },
+        "body": null
+    },
+    "delay_between_a_and_b_ms": 500,
+    "delay_between_a_requests_ms": 3000,
+    "max_requests": 10,
+    "digest_auth": {
+        "username": "testuser",
+        "password": "testpass",
+        "realm": "testrealm",
+        "nonce": "123456"
+    }
+}
