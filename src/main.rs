@@ -208,6 +208,7 @@ async fn send_request_with_auth(
     let mut request_builder = match config.method.to_uppercase().as_str() {
         "GET" => client.get(&config.url),
         "POST" => client.post(&config.url),
+        "PUT" => client.put(&config.url),
         method => return Err(format!("Unsupported HTTP method: {}", method)),
     };
 
@@ -228,6 +229,10 @@ async fn send_request_with_auth(
 
     // Add body for POST requests
     if config.method.to_uppercase() == "POST" {
+        if let Some(body) = &config.body {
+            request_builder = request_builder.body(body.clone());
+        }
+    } else if config.method.to_uppercase() == "PUT" {
         if let Some(body) = &config.body {
             request_builder = request_builder.body(body.clone());
         }
@@ -310,6 +315,7 @@ async fn send_request_async(
         }
         Err(e) => {
             stats_guard.failed_requests += 1;
+            println!("🎯 request failed:  {}", e);
             stats_guard.last_error = Some(e.clone());
         }
     }
@@ -453,52 +459,99 @@ async fn main() {
     let config = RequestConfig {
         request_a: HttpRequestConfig {
             method: "POST".to_string(),
-            url: "https://httpbin.org/post".to_string(),
+            url: "https://10.41.131.87/ISAPI/System/AlgoPackageScheduling/AddTask?format=json".to_string(),
             headers: Some({
                 let mut headers = HashMap::new();
                 headers.insert("Content-Type".to_string(), "application/json".to_string());
                 headers
             }),
-            body: Some(r#"{"message": "Hello from request A", "session_id": "{session_id}", "request_id": "{request_id}", "timestamp": "{timestamp}"}"#.to_string()),
+            body: Some(r#"
+            {
+                "taskName": "{{taskID}}",
+                "customInfo": "test",
+                "taskID": "{{taskID}}",
+                "nodeID": "1",
+                "algoPackageID": "NTkmMCYxJjEyJjEuMC4xNSYxJjEmdmlkZW8mJjA=",
+                "algoID": "smokeAndFireDetection",
+                "DataSource": {
+                    "sourceType": "video",
+                    "pollingTime": 10,
+                    "StreamList": [
+                        {
+                            "cameraIndexCode": "24e3fdcd1b2441f6a3be07b945e391ce",
+                            "rule": "{\"pictureAddTarget\":true,\"pictureAddRule\":true,\"rulesParam\":[{\"algorithmID\":\"NTkmMCYxJjEyJjEuMC4xNSYxJjEmdmlkZW8mJjA=_smokeAndFireDetection\",\"commonParams\":{\"TimeList\":[{\"day\":\"monday\",\"timeRange\":[{\"startTime\":\"00:00:00\",\"endTime\":\"23:59:59\"}]},{\"day\":\"tuesday\",\"timeRange\":[{\"startTime\":\"00:00:00\",\"endTime\":\"23:59:59\"}]},{\"day\":\"wednesday\",\"timeRange\":[{\"startTime\":\"00:00:00\",\"endTime\":\"23:59:59\"}]},{\"day\":\"thursday\",\"timeRange\":[{\"startTime\":\"00:00:00\",\"endTime\":\"23:59:59\"}]},{\"day\":\"friday\",\"timeRange\":[{\"startTime\":\"00:00:00\",\"endTime\":\"23:59:59\"}]},{\"day\":\"saturday\",\"timeRange\":[{\"startTime\":\"00:00:00\",\"endTime\":\"23:59:59\"}]},{\"day\":\"sunday\",\"timeRange\":[{\"startTime\":\"00:00:00\",\"endTime\":\"23:59:59\"}]}]},\"ruleCustomName\":\"新增规则\",\"eventType\":\"smokeAndFireDetection\",\"scene\":\"smokeAndFire\",\"ruleId\":\"574a60848fb7434483a33670e89b5338\",\"ruleID\":\"574a60848fb7434483a33670e89b5338\",\"paramsInfo\":{\"smokeSensitivity\":2,\"Region\":[{\"x\":0.023876,\"y\":0.245614},{\"x\":0.325843,\"y\":0.250627},{\"x\":0.30618,\"y\":0.954887},{\"x\":0.01264,\"y\":0.9599}],\"sensitivity\":2,\"uploadMode\":\"filter\",\"alarmDelayConfirmSensitivity\":4}}],\"shieldRegion\":[]}",
+                            "RTSPURL": "rtsp://admin:backend15@10.14.99.155:554/ISAPI/streaming/channels/101"
+                        }
+                    ]
+                },
+                "Destination": [
+                    {
+                        "type": "ServerHCS",
+                        "addressType": "ipaddress",
+                        "ipV4Address": "10.41.131.62",
+                        "portNo": 6011,
+                        "accessKey": "3Yht1fJl6nkg735uQ3oB8Gx89Jj0Xz1aoOIx819PIPpgklb60V89WBa5S07Zr5C",
+                        "secretKey": "o6n66M48S3v1cK3fsm639sNA4i9739S5AUD54a88672756bGuW0jPEo99AF4IYA",
+                        "poolID": "196661251",
+                        "downloadPort": 6120,
+                        "SSLEnabled": false
+                    },
+                    {
+                        "type":  "ServerClient",	
+                        "protocolType":  "HTTP",	
+                        "addressType":  "ipaddress",	
+                        "ipV4Address":  "10.14.99.71",	
+                        "portNo":  8000,	
+                        "URI":  "/httpalarm"
+                    }
+                ]
+            }"#.to_string()),
         },
         request_b: HttpRequestConfig {
-            method: "GET".to_string(),
-            url: "https://httpbin.org/get".to_string(),
+            method: "PUT".to_string(),
+            url: "http://10.41.131.87/ISAPI/System/AlgoPackageScheduling/DeleteTask?format=json".to_string(),
             headers: None,
-            body: None,
+            body: Some(r#"
+            {
+                "TaskIDList": [
+                    {
+                        "taskID":"{{taskID}}"
+                    }
+                ]
+            }"#.to_string()),
         },
         delay_between_a_and_b_ms: 500,
         delay_between_a_requests_ms: 3000,
-        max_requests: Some(3),
+        max_requests: Some(1),
         digest_auth: Some(DigestAuthConfig {
-            username: "testuser".to_string(),
-            password: "testpass".to_string(),
-            realm: Some("testrealm".to_string()),
-            nonce: Some("123456".to_string()),
+            username: "admin".to_string(),
+            password: "backend15".to_string(),
+            realm: None,
+            nonce: None,
         }),
         generated_fields: Some(vec![
+            // GeneratedField {
+            //     name: "session_id".to_string(),
+            //     generator: "random".to_string(),
+            //     field_type: "body".to_string(),
+            //     value: None,
+            // },
+            // GeneratedField {
+            //     name: "request_id".to_string(),
+            //     generator: "counter".to_string(),
+            //     field_type: "body".to_string(),
+            //     value: None,
+            // },
+            // GeneratedField {
+            //     name: "timestamp".to_string(),
+            //     generator: "timestamp".to_string(),
+            //     field_type: "body".to_string(),
+            //     value: None,
+            // },
             GeneratedField {
-                name: "session_id".to_string(),
-                generator: "random".to_string(),
+                name: "taskID".to_string(),
+                generator: "uuid".to_string(),
                 field_type: "body".to_string(),
-                value: None,
-            },
-            GeneratedField {
-                name: "request_id".to_string(),
-                generator: "counter".to_string(),
-                field_type: "body".to_string(),
-                value: None,
-            },
-            GeneratedField {
-                name: "timestamp".to_string(),
-                generator: "timestamp".to_string(),
-                field_type: "body".to_string(),
-                value: None,
-            },
-            GeneratedField {
-                name: "X-Session-ID".to_string(),
-                generator: "random".to_string(),
-                field_type: "header".to_string(),
                 value: None,
             },
         ]),
