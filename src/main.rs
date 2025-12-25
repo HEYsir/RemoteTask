@@ -6,6 +6,10 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
 
+// Import logger module
+mod logger;
+use logger::{LogLevel, set_log_level};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpRequestConfig {
     pub method: String, // "GET" or "POST"
@@ -93,7 +97,6 @@ fn build_digest_auth_header(
     realm: &str,
     nonce: &str,
 ) -> String {
-    use base64::prelude::*;
     use md5::{Digest, Md5};
 
     // HA1 = MD5(username:realm:password)
@@ -221,7 +224,7 @@ async fn send_request_with_auth(
 
     // Add generated header fields if provided
     if let Some(fields) = header_fields {
-        println!("📤 Injecting header fields: {:?}", fields);
+        log_trace!("📤 Injecting header fields: {:?}", fields);
         for (key, value) in fields {
             request_builder = request_builder.header(key, value);
         }
@@ -257,7 +260,7 @@ async fn send_request_with_auth(
         Ok(response) => {
             let duration = start_time.elapsed();
             if response.status().is_success() {
-                println!(
+                log_info!(
                     "✅ {} request to {} succeeded in {:.2}ms (Status: {})",
                     config.method,
                     config.url,
@@ -315,7 +318,7 @@ async fn send_request_async(
         }
         Err(e) => {
             stats_guard.failed_requests += 1;
-            println!("🎯 request failed:  {}", e);
+            log_error!("🎯 request failed:  {}", e);
             stats_guard.last_error = Some(e.clone());
         }
     }
@@ -336,23 +339,23 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
             // Check if we've reached the maximum number of requests
             if let Some(max) = config_clone.max_requests {
                 if request_count >= max {
-                    println!("🎯 Reached maximum request count of {}", max);
+                    log_info!("🎯 Reached maximum request count of {}", max);
                     break;
                 }
             }
 
             request_count += 1;
-            println!("\n--- Request Cycle {} ---", request_count);
+            log_debug!("\n--- Request Cycle {} ---", request_count);
 
             // Separate fields by type (header vs body)
             let (header_fields, body_fields) =
                 separate_fields_by_type(&config_clone.generated_fields, request_count);
 
             if !header_fields.is_empty() {
-                println!("🎲 Generated header fields: {:?}", header_fields);
+                log_trace!("🎲 Generated header fields: {:?}", header_fields);
             }
             if !body_fields.is_empty() {
-                println!("📝 Generated body fields: {:?}", body_fields);
+                log_trace!("📝 Generated body fields: {:?}", body_fields);
             }
 
             // Create dynamic body content for A and B requests
@@ -360,7 +363,7 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
                 let mut config = config_clone.request_a.clone();
                 if !body_fields.is_empty() {
                     config.body = generate_dynamic_body(&config.body, &body_fields);
-                    println!("📝 Dynamic body for A: {:?}", config.body);
+                    log_trace!("📝 Dynamic body for A: {:?}", config.body);
                 }
                 config
             };
@@ -369,7 +372,7 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
                 let mut config = config_clone.request_b.clone();
                 if !body_fields.is_empty() {
                     config.body = generate_dynamic_body(&config.body, &body_fields);
-                    println!("📝 Dynamic body for B: {:?}", config.body);
+                    log_trace!("📝 Dynamic body for B: {:?}", config.body);
                 }
                 config
             };
@@ -380,7 +383,7 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
 
             if time_since_last_a < required_delay {
                 let remaining_delay = required_delay - time_since_last_a;
-                println!(
+                log_trace!(
                     "⏳ Waiting {}ms to ensure proper A request spacing",
                     remaining_delay.as_millis()
                 );
@@ -429,18 +432,18 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
     });
 
     // Wait for the request task to complete
-    println!("🚀 Concurrent HTTP requests started!");
-    println!("Features:");
-    println!("  ✅ GET and POST requests supported");
-    println!("  ✅ Digest authentication supported");
-    println!("  ✅ A and B requests with shared generated fields");
-    println!("  ✅ Header and body field generation support");
-    println!("  ✅ Precise delay control");
-    println!("Press Ctrl+C to stop...");
+    log_info!("🚀 Concurrent HTTP requests started!");
+    log_trace!("Features:");
+    log_trace!("  ✅ GET and POST requests supported");
+    log_trace!("  ✅ Digest authentication supported");
+    log_trace!("  ✅ A and B requests with shared generated fields");
+    log_trace!("  ✅ Header and body field generation support");
+    log_trace!("  ✅ Precise delay control");
+    log_info!("Press Ctrl+C to stop...");
 
     match request_task.await {
-        Ok(_) => println!("\n✅ All request cycles completed!"),
-        Err(e) => println!("\n❌ Request task failed: {}", e),
+        Ok(_) => log_info!("\n✅ All request cycles completed!"),
+        Err(e) => log_error!("\n❌ Request task failed: {}", e),
     }
 
     // Return final stats
@@ -450,10 +453,13 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
 
 #[tokio::main]
 async fn main() {
-    println!("🌐 Advanced Rust Concurrent HTTP Request Tool");
-    println!("==============================================");
-    println!("📝 Features: GET/POST requests, Digest auth, field generation");
-    println!();
+    // Set default log level to Info
+    set_log_level(LogLevel::Info);
+
+    log_info!("🌐 Advanced Rust Concurrent HTTP Request Tool");
+    log_info!("==============================================");
+    log_info!("📝 Features: GET/POST requests, Digest auth, field generation");
+    log_info!("");
 
     // Example configuration with POST requests and digest auth
     let config = RequestConfig {
@@ -557,45 +563,47 @@ async fn main() {
         ]),
     };
 
-    println!("📋 Configuration:");
-    println!("  Request A:");
-    println!("    Method: {}", config.request_a.method);
-    println!("    URL: {}", config.request_a.url);
-    println!("    Body: {:?}", config.request_a.body);
-    println!("  Request B:");
-    println!("    Method: {}", config.request_b.method);
-    println!("    URL: {}", config.request_b.url);
-    println!("  Delays:");
-    println!("    A→B: {}ms", config.delay_between_a_and_b_ms);
-    println!("    A→A: {}ms", config.delay_between_a_requests_ms);
-    println!("  Authentication:");
+    log_info!("📋 Configuration:");
+    log_info!("  Request A:");
+    log_info!("    Method: {}", config.request_a.method);
+    log_info!("    URL: {}", config.request_a.url);
+    log_trace!("    Body: {:?}", config.request_a.body);
+    log_info!("  Request B:");
+    log_info!("    Method: {}", config.request_b.method);
+    log_info!("    URL: {}", config.request_b.url);
+    log_info!("  Delays:");
+    log_info!("    A→B: {}ms", config.delay_between_a_and_b_ms);
+    log_info!("    A→A: {}ms", config.delay_between_a_requests_ms);
+    log_info!("  Authentication:");
     if let Some(auth) = &config.digest_auth {
-        println!("    Username: {}", auth.username);
-        println!("    Realm: {}", auth.realm.as_deref().unwrap_or("default"));
+        log_info!("    Username: {}", auth.username);
+        log_info!("    Realm: {}", auth.realm.as_deref().unwrap_or("default"));
     } else {
-        println!("    None");
+        log_info!("    None");
     }
-    println!("  Generated Fields:");
+    log_info!("  Generated Fields:");
     if let Some(fields) = &config.generated_fields {
         for field in fields {
-            println!(
+            log_info!(
                 "    {}: {} ({})",
-                field.name, field.generator, field.field_type
+                field.name,
+                field.generator,
+                field.field_type
             );
         }
     } else {
-        println!("    None");
+        log_info!("    None");
     }
-    println!();
+    log_info!("");
 
     // Run the concurrent requests
     let stats = run_concurrent_requests(config).await;
 
-    println!("\n📊 Final Statistics:");
-    println!("  Total requests: {}", stats.total_requests);
-    println!("  Successful: {}", stats.successful_requests);
-    println!("  Failed: {}", stats.failed_requests);
+    log_info!("\n📊 Final Statistics:");
+    log_info!("  Total requests: {}", stats.total_requests);
+    log_info!("  Successful: {}", stats.successful_requests);
+    log_info!("  Failed: {}", stats.failed_requests);
     if let Some(error) = &stats.last_error {
-        println!("  Last error: {}", error);
+        log_error!("  Last error: {}", error);
     }
 }
