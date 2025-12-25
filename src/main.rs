@@ -1,4 +1,4 @@
-use reqwest::Client;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -6,8 +6,10 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
 
-// Import logger module
+// Import modules
+mod http_client;
 mod logger;
+use http_client::{AuthConfig, AuthType, HttpClient, HttpClientConfig};
 use logger::{LogLevel, set_log_level};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,35 +88,6 @@ impl RequestStats {
             last_error: None,
         }
     }
-}
-
-// Simple digest authentication implementation
-fn build_digest_auth_header(
-    method: &str,
-    uri: &str,
-    username: &str,
-    password: &str,
-    realm: &str,
-    nonce: &str,
-) -> String {
-    use md5::{Digest, Md5};
-
-    // HA1 = MD5(username:realm:password)
-    let ha1_data = format!("{}:{}:{}", username, realm, password);
-    let ha1 = format!("{:x}", Md5::digest(ha1_data.as_bytes()));
-
-    // HA2 = MD5(method:uri)
-    let ha2_data = format!("{}:{}", method, uri);
-    let ha2 = format!("{:x}", Md5::digest(ha2_data.as_bytes()));
-
-    // Response = MD5(HA1:nonce:HA2)
-    let response_data = format!("{}:{}:{}", ha1, nonce, ha2);
-    let response = format!("{:x}", Md5::digest(response_data.as_bytes()));
-
-    format!(
-        "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\"",
-        username, realm, nonce, uri, response
-    )
 }
 
 // Field generator functions
@@ -200,66 +173,128 @@ fn generate_dynamic_body(
     }
 }
 
-async fn send_request_with_auth(
-    client: &Client,
-    config: &HttpRequestConfig,
-    auth_config: Option<&DigestAuthConfig>,
-    header_fields: Option<&HashMap<String, String>>,
-) -> Result<(), String> {
-    let start_time = Instant::now();
+// Helper function to create a basic reqwest client
+fn create_reqwest_client() -> Result<reqwest::Client, anyhow::Error> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create reqwest client: {}", e))
+}
 
-    let mut request_builder = match config.method.to_uppercase().as_str() {
-        "GET" => client.get(&config.url),
-        "POST" => client.post(&config.url),
-        "PUT" => client.put(&config.url),
-        method => return Err(format!("Unsupported HTTP method: {}", method)),
+// Helper function to add headers to a request
+fn add_headers_to_request(
+    mut request: reqwest::RequestBuilder,
+    headers: &Option<HashMap<String, String>>,
+) -> reqwest::RequestBuilder {
+    if let Some(headers) = headers {
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+    }
+    request
+}
+
+// Helper function to handle Basic authentication
+fn add_basic_auth(
+    mut request: reqwest::RequestBuilder,
+    auth_config: &AuthConfig,
+) -> reqwest::RequestBuilder {
+    let auth_value = format!("{}:{}", auth_config.username, auth_config.password);
+    let encoded = base64::prelude::BASE64_STANDARD.encode(auth_value.as_bytes());
+    request.header("Authorization", format!("Basic {}", encoded))
+}
+
+// Helper function to handle Digest authentication
+async fn handle_digest_auth(
+    request: reqwest::RequestBuilder,
+    url: &str,
+    auth_config: &AuthConfig,
+) -> Result<reqwest::RequestBuilder, anyhow::Error> {
+    // First attempt without auth to get challenge
+    let response_result = request.try_clone().unwrap().send().await;
+
+    let mut final_request = request;
+
+    if let Ok(response) = response_result {
+        if response.status().as_u16() == 401 {
+            // Create a new HttpClient to handle digest auth
+            let digest_client = HttpClient::new(HttpClientConfig {
+                timeout: Duration::from_secs(30),
+                user_agent: "RemoteTask-HTTP-Client/1.0".to_string(),
+                auth: Some(auth_config.clone()),
+            })?;
+
+            // Use post_json method which handles digest auth internally
+            let temp_response = digest_client.post_json(url, "", None).await?;
+
+            // Extract Authorization header if present
+            if let Some(auth_header) = temp_response.headers().get("Authorization") {
+                let auth_string = auth_header.to_str().unwrap_or("");
+                final_request = final_request.header("Authorization", auth_string);
+            }
+        }
+    }
+
+    Ok(final_request)
+}
+
+// Helper function to add authentication to request
+async fn add_authentication(
+    request: reqwest::RequestBuilder,
+    url: &str,
+    auth_config: Option<&AuthConfig>,
+) -> Result<reqwest::RequestBuilder, anyhow::Error> {
+    if let Some(auth_cfg) = auth_config {
+        match auth_cfg.auth_type {
+            AuthType::Basic => Ok(add_basic_auth(request, auth_cfg)),
+            AuthType::Digest => handle_digest_auth(request, url, auth_cfg).await,
+        }
+    } else {
+        Ok(request)
+    }
+}
+
+// Helper function to handle HTTP client creation and error reporting
+async fn create_http_client(
+    auth_config: Option<&AuthConfig>,
+    stats: &Arc<Mutex<RequestStats>>,
+) -> Option<HttpClient> {
+    let http_client_config = HttpClientConfig {
+        timeout: Duration::from_secs(30),
+        user_agent: "RemoteTask-HTTP-Client/1.0".to_string(),
+        auth: auth_config.cloned(),
     };
 
-    // Add headers if provided
-    if let Some(headers) = &config.headers {
-        for (key, value) in headers {
-            request_builder = request_builder.header(key, value);
+    match HttpClient::new(http_client_config) {
+        Ok(client) => Some(client),
+        Err(e) => {
+            let mut stats_guard = stats.lock().await;
+            stats_guard.total_requests += 1;
+            stats_guard.failed_requests += 1;
+            let error_msg = format!("❌ Failed to create HTTP client: {}", e);
+            log_error!("🎯 request failed: {}", error_msg);
+            stats_guard.last_error = Some(error_msg);
+            None
         }
     }
+}
 
-    // Add generated header fields if provided
-    if let Some(fields) = header_fields {
-        log_trace!("📤 Injecting header fields: {:?}", fields);
-        for (key, value) in fields {
-            request_builder = request_builder.header(key, value);
-        }
-    }
+// Helper function to handle response and update statistics
+async fn handle_response(
+    result: Result<reqwest::Response, anyhow::Error>,
+    config: &HttpRequestConfig,
+    start_time: Instant,
+    stats: &Arc<Mutex<RequestStats>>,
+) {
+    let duration = start_time.elapsed();
+    let mut stats_guard = stats.lock().await;
+    stats_guard.total_requests += 1;
 
-    // Add body for POST requests
-    if config.method.to_uppercase() == "POST" {
-        if let Some(body) = &config.body {
-            request_builder = request_builder.body(body.clone());
-        }
-    } else if config.method.to_uppercase() == "PUT" {
-        if let Some(body) = &config.body {
-            request_builder = request_builder.body(body.clone());
-        }
-    }
-
-    // Add digest authentication if configured
-    if let Some(auth) = auth_config {
-        let realm = auth.realm.as_deref().unwrap_or("");
-        let nonce = auth.nonce.as_deref().unwrap_or("123456");
-        let auth_header = build_digest_auth_header(
-            &config.method,
-            &config.url,
-            &auth.username,
-            &auth.password,
-            realm,
-            nonce,
-        );
-        request_builder = request_builder.header("Authorization", &auth_header);
-    }
-
-    match request_builder.send().await {
+    match &result {
         Ok(response) => {
-            let duration = start_time.elapsed();
             if response.status().is_success() {
+                stats_guard.successful_requests += 1;
                 log_info!(
                     "✅ {} request to {} succeeded in {:.2}ms (Status: {})",
                     config.method,
@@ -267,8 +302,8 @@ async fn send_request_with_auth(
                     duration.as_millis(),
                     response.status()
                 );
-                Ok(())
             } else {
+                stats_guard.failed_requests += 1;
                 let error_msg = format!(
                     "❌ {} request to {} failed with status: {} in {:.2}ms",
                     config.method,
@@ -276,11 +311,12 @@ async fn send_request_with_auth(
                     response.status(),
                     duration.as_millis()
                 );
-                Err(error_msg)
+                log_error!("🎯 request failed:  {}", error_msg);
+                stats_guard.last_error = Some(error_msg);
             }
         }
         Err(e) => {
-            let duration = start_time.elapsed();
+            stats_guard.failed_requests += 1;
             let error_msg = format!(
                 "❌ {} request to {} failed with error: {} in {:.2}ms",
                 config.method,
@@ -288,40 +324,132 @@ async fn send_request_with_auth(
                 e,
                 duration.as_millis()
             );
-            Err(error_msg)
+            log_error!("🎯 request failed:  {}", error_msg);
+            stats_guard.last_error = Some(error_msg);
         }
     }
 }
 
+// Main function for sending POST requests using HttpClient
+async fn send_post_request(
+    config: &HttpRequestConfig,
+    auth_config: Option<&AuthConfig>,
+    stats: &Arc<Mutex<RequestStats>>,
+) -> Result<reqwest::Response, anyhow::Error> {
+    if let Some(body) = &config.body {
+        if let Some(http_client) = create_http_client(auth_config, stats).await {
+            // Convert HashMap headers to Vec of tuples for http_client
+            let headers = config.headers.as_ref().map(|headers| {
+                headers
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect::<Vec<_>>()
+            });
+
+            http_client
+                .post_json(&config.url, body, headers)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))
+        } else {
+            Err(anyhow::anyhow!(
+                "Failed to create HTTP client for POST request"
+            ))
+        }
+    } else {
+        Err(anyhow::anyhow!("POST request requires a body"))
+    }
+}
+
+// Main function for sending PUT/GET requests using reqwest client
+async fn send_standard_request(
+    config: &HttpRequestConfig,
+    auth_config: Option<&AuthConfig>,
+) -> Result<reqwest::Response, anyhow::Error> {
+    let client = create_reqwest_client()?;
+
+    let method = config.method.to_uppercase();
+    let mut request = match method.as_str() {
+        "PUT" => {
+            if let Some(body) = &config.body {
+                client.put(&config.url).body(body.clone())
+            } else {
+                return Err(anyhow::anyhow!("PUT request requires a body"));
+            }
+        }
+        "GET" => client.get(&config.url),
+        _ => return Err(anyhow::anyhow!("Unsupported HTTP method: {}", method)),
+    };
+
+    // Add Content-Type header for JSON if it's a PUT request
+    if method == "PUT" {
+        request = request.header("Content-Type", "application/json");
+    }
+
+    // Add custom headers
+    request = add_headers_to_request(request, &config.headers);
+
+    // Add authentication
+    request = add_authentication(request, &config.url, auth_config).await?;
+
+    request.send().await.map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+// Refactored main request function
 async fn send_request_async(
-    client: Client,
     config: HttpRequestConfig,
+    auth_config: Option<&AuthConfig>,
     _request_type: String,
     stats: Arc<Mutex<RequestStats>>,
-    auth_config: Option<DigestAuthConfig>,
-    header_fields: Option<HashMap<String, String>>,
 ) {
-    let result = send_request_with_auth(
-        &client,
-        &config,
-        auth_config.as_ref(),
-        header_fields.as_ref(),
-    )
-    .await;
+    let start_time = Instant::now();
+    let method = config.method.to_uppercase();
 
-    let mut stats_guard = stats.lock().await;
-    stats_guard.total_requests += 1;
+    let result = match method.as_str() {
+        "POST" => send_post_request(&config, auth_config, &stats).await,
+        "PUT" | "GET" => send_standard_request(&config, auth_config).await,
+        _ => Err(anyhow::anyhow!("Unsupported HTTP method: {}", method)),
+    };
 
-    match &result {
-        Ok(_) => {
-            stats_guard.successful_requests += 1;
+    handle_response(result, &config, start_time, &stats).await;
+}
+
+// New function for sending requests with shared HttpClient (authentication reuse)
+async fn send_request_with_shared_client(
+    config: HttpRequestConfig,
+    http_client: Arc<HttpClient>,
+    _request_type: String,
+    stats: Arc<Mutex<RequestStats>>,
+) {
+    let start_time = Instant::now();
+    let method = config.method.to_uppercase();
+
+    // Convert HashMap headers to Vec of tuples for http_client
+    let headers = config.headers.as_ref().map(|headers| {
+        headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect::<Vec<_>>()
+    });
+
+    let result = match method.as_str() {
+        "POST" => {
+            if let Some(body) = &config.body {
+                http_client
+                    .post_json(&config.url, body, headers)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))
+            } else {
+                Err(anyhow::anyhow!("POST request requires a body"))
+            }
         }
-        Err(e) => {
-            stats_guard.failed_requests += 1;
-            log_error!("🎯 request failed:  {}", e);
-            stats_guard.last_error = Some(e.clone());
-        }
-    }
+        "PUT" | "GET" => http_client
+            .send_request(&method, &config.url, config.body.clone(), headers)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e)),
+        _ => Err(anyhow::anyhow!("Unsupported HTTP method: {}", method)),
+    };
+
+    handle_response(result, &config, start_time, &stats).await;
 }
 
 async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
@@ -334,6 +462,9 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
     let request_task = tokio::spawn(async move {
         let mut request_count = 0;
         let mut last_a_request_time = Instant::now();
+
+        // Note: The new HttpClient is not being used since we're using standard reqwest clients
+        // This preserves the authentication configuration for future use if needed
 
         loop {
             // Check if we've reached the maximum number of requests
@@ -393,38 +524,71 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
             // Update last A request time
             last_a_request_time = Instant::now();
 
-            // Create separate clients for A and B requests
-            let client_a = Client::new();
-            let client_b = Client::new();
-
             let stats_a = Arc::clone(&stats_clone);
             let stats_b = Arc::clone(&stats_clone);
 
-            let auth_config = config_clone.digest_auth.clone();
-            let header_fields_clone = header_fields.clone();
+            // Create shared HttpClient for authentication reuse
+            let http_client = {
+                let auth_config = config_clone
+                    .digest_auth
+                    .as_ref()
+                    .map(|digest_auth| AuthConfig {
+                        username: digest_auth.username.clone(),
+                        password: digest_auth.password.clone(),
+                        auth_type: AuthType::Digest,
+                    });
 
-            // Send request A with header fields
-            let a_handle = tokio::spawn(send_request_async(
-                client_a,
-                config_a,
-                "A".to_string(),
-                stats_a,
-                auth_config.clone(),
-                Some(header_fields),
-            ));
+                let http_client_config = HttpClientConfig {
+                    timeout: Duration::from_secs(30),
+                    user_agent: "RemoteTask-HTTP-Client/1.0".to_string(),
+                    auth: auth_config,
+                };
+
+                match HttpClient::new(http_client_config) {
+                    Ok(client) => Arc::new(client),
+                    Err(e) => {
+                        log_error!("Failed to create HTTP client: {}", e);
+                        return;
+                    }
+                }
+            };
+
+            // Send request A with shared HttpClient (authentication reuse)
+            let a_handle = {
+                let http_client_clone = Arc::clone(&http_client);
+                let config_a_clone = config_a.clone();
+                let stats_a_clone = Arc::clone(&stats_a);
+
+                tokio::spawn(async move {
+                    send_request_with_shared_client(
+                        config_a_clone,
+                        http_client_clone,
+                        "A".to_string(),
+                        stats_a_clone,
+                    )
+                    .await;
+                })
+            };
 
             // Wait before sending request B
             sleep(Duration::from_millis(config_clone.delay_between_a_and_b_ms)).await;
 
-            // Send request B with the same header fields
-            let b_handle = tokio::spawn(send_request_async(
-                client_b,
-                config_b,
-                "B".to_string(),
-                stats_b,
-                auth_config,
-                Some(header_fields_clone),
-            ));
+            // Send request B with shared HttpClient (authentication reuse)
+            let b_handle = {
+                let http_client_clone = Arc::clone(&http_client);
+                let config_b_clone = config_b.clone();
+                let stats_b_clone = Arc::clone(&stats_b);
+
+                tokio::spawn(async move {
+                    send_request_with_shared_client(
+                        config_b_clone,
+                        http_client_clone,
+                        "B".to_string(),
+                        stats_b_clone,
+                    )
+                    .await;
+                })
+            };
 
             // Wait for both requests to complete
             let _ = tokio::try_join!(a_handle, b_handle);
@@ -435,7 +599,8 @@ async fn run_concurrent_requests(config: RequestConfig) -> RequestStats {
     log_info!("🚀 Concurrent HTTP requests started!");
     log_trace!("Features:");
     log_trace!("  ✅ GET and POST requests supported");
-    log_trace!("  ✅ Digest authentication supported");
+    log_trace!("  ✅ Digest authentication with smart auth handling");
+    log_trace!("  ✅ Cookie-based session management");
     log_trace!("  ✅ A and B requests with shared generated fields");
     log_trace!("  ✅ Header and body field generation support");
     log_trace!("  ✅ Precise delay control");

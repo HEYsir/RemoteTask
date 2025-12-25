@@ -44,6 +44,7 @@ pub struct HttpClient {
     client: Client,
     config: HttpClientConfig,
     cookie_jar: Arc<Jar>,
+    auth_cache: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 impl HttpClient {
@@ -63,6 +64,7 @@ impl HttpClient {
             client,
             config,
             cookie_jar,
+            auth_cache: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -71,7 +73,7 @@ impl HttpClient {
         Self::new(Default::default())
     }
 
-    /// 发送 POST 请求（支持智能认证）
+    /// 发送 POST 请求（支持智能认证和认证复用）
     pub async fn post_json(
         &self,
         url: &str,
@@ -90,7 +92,12 @@ impl HttpClient {
             }
         }
 
-        // 智能认证处理：先尝试无认证请求，如果失败再添加认证
+        // 检查是否有缓存的认证头
+        if let Some(cached_auth) = self.get_cached_auth().await {
+            request = request.header("Authorization", &cached_auth);
+        }
+
+        // 发送请求
         let response = request.try_clone().unwrap().send().await?;
 
         // 检查是否需要认证
@@ -100,6 +107,9 @@ impl HttpClient {
 
         // 处理认证
         let auth_string = self.get_auth(response, url, "POST").await?;
+
+        // 缓存认证头
+        self.set_cached_auth(auth_string.clone()).await;
 
         // 重新发送认证请求
         let request = request.header("Authorization", auth_string);
@@ -182,5 +192,114 @@ impl HttpClient {
 
         // println!("生成的 Digest 认证头: {}", auth_response);
         Ok(auth_response.to_string())
+    }
+
+    /// 获取缓存的认证头
+    async fn get_cached_auth(&self) -> Option<String> {
+        let cache_guard = self.auth_cache.lock().await;
+        cache_guard.clone()
+    }
+
+    /// 设置缓存的认证头
+    async fn set_cached_auth(&self, auth_string: String) {
+        let mut cache_guard = self.auth_cache.lock().await;
+        *cache_guard = Some(auth_string);
+    }
+
+    /// 清除缓存的认证头
+    pub async fn clear_auth_cache(&self) {
+        let mut cache_guard = self.auth_cache.lock().await;
+        *cache_guard = None;
+    }
+
+    /// 获取认证头（可用于其他HTTP方法）
+    pub async fn get_auth_header(&self, url: &str, method: &str) -> Result<Option<String>> {
+        // 检查是否有缓存的认证头
+        if let Some(cached_auth) = self.get_cached_auth().await {
+            return Ok(Some(cached_auth));
+        }
+
+        // 如果没有缓存，执行一次预认证请求
+        let request = self.client.request(
+            match method {
+                "GET" => reqwest::Method::GET,
+                "POST" => reqwest::Method::POST,
+                "PUT" => reqwest::Method::PUT,
+                "DELETE" => reqwest::Method::DELETE,
+                _ => reqwest::Method::GET,
+            },
+            url,
+        );
+
+        let response = request.send().await?;
+
+        if response.status().as_u16() == 401 {
+            let auth_string = self.get_auth(response, url, method).await?;
+            self.set_cached_auth(auth_string.clone()).await;
+            Ok(Some(auth_string))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// 发送通用HTTP请求（支持认证复用）
+    pub async fn send_request(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<String>,
+        headers: Option<Vec<(&str, &str)>>,
+    ) -> Result<Response> {
+        let http_method = match method {
+            "GET" => reqwest::Method::GET,
+            "POST" => reqwest::Method::POST,
+            "PUT" => reqwest::Method::PUT,
+            "DELETE" => reqwest::Method::DELETE,
+            _ => return Err(anyhow!("Unsupported HTTP method: {}", method)),
+        };
+
+        let mut request = self.client.request(http_method, url);
+
+        // 添加请求体
+        if let Some(body_data) = body {
+            request = request.body(body_data);
+            // 对于有body的请求，添加Content-Type头
+            if method == "POST" || method == "PUT" {
+                request = request.header("Content-Type", "application/json");
+            }
+        }
+
+        // 添加自定义头部
+        if let Some(headers) = headers {
+            for (key, value) in headers {
+                request = request.header(key, value);
+            }
+        }
+
+        // 检查是否有缓存的认证头
+        if let Some(cached_auth) = self.get_cached_auth().await {
+            request = request.header("Authorization", &cached_auth);
+        }
+
+        // 发送请求
+        let response = request.try_clone().unwrap().send().await?;
+
+        // 检查是否需要认证
+        if response.status().as_u16() != 401 {
+            return Ok(response);
+        }
+
+        // 处理认证
+        let auth_string = self.get_auth(response, url, method).await?;
+
+        // 缓存认证头
+        self.set_cached_auth(auth_string.clone()).await;
+
+        // 重新发送认证请求
+        let request = request.header("Authorization", auth_string);
+        request
+            .send()
+            .await
+            .map_err(|e| anyhow!("HTTP request failed: {}", e))
     }
 }
